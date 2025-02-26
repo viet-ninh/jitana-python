@@ -8,16 +8,6 @@
 char script_name[256];
 char func_name[256];
 
-struct FunctionNode
-{
-    std::string func_name;
-};
-
-struct EdgeData{
-    std::string function_origin;
-    std::string function_destination;
-};
-
 // Load Python module with a given name
 PyObject* load_python_module(const char* module_name){
 
@@ -34,8 +24,6 @@ PyObject* load_python_module(const char* module_name){
 // Load a Python function from a module
 PyObject* load_python_function(PyObject *pModule, const char* func_name) {
     PyObject *pFunc = PyObject_GetAttrString(pModule, func_name);
-    FunctionNode func_node;
-    func_node.func_name = func_name;
     if (!pFunc || !PyCallable_Check(pFunc)) {
         PyErr_Print();
         fprintf(stderr, "Function %s not found or not callable\n", func_name);
@@ -55,10 +43,11 @@ void print_bytecode(PyObject *pFunc) {
             Py_ssize_t bytecode_len = PyBytes_Size(pBytecode);
             std::ofstream file("output/bytecode.txt");
             if (file.is_open()){
-                    file << "Bytecode for function: \n";
+                
+                file << "Bytecode for function: \n";
                 for (Py_ssize_t i = 0; i < bytecode_len; i++) {
-                    file << std::hex
-                         << static_cast<int>(bytecode[i]);
+                    file << std::hex << std::setw(2) << std::setfill('0') 
+                         << static_cast<unsigned int>(bytecode[i] & 0xFF) << " ";
                 }
                 file.close();
             }
@@ -66,9 +55,6 @@ void print_bytecode(PyObject *pFunc) {
                 std::cerr << "Error: Unable to create file. \n";
             }
 
-            // printf("Bytecode for the function:\n");
-            // // printf("%02x ", (unsigned char) bytecode[i]);
-            // printf("\n");
             Py_DECREF(pBytecode);
         }
         Py_DECREF(pCode);
@@ -109,10 +95,19 @@ void disassemble_function(PyObject *pFunc){
     }
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    printf("%s \n", argv[1]);
+    std::string file_path = argv[1];
     Py_Initialize();
-    PyRun_SimpleString("import sys");
-    PyRun_SimpleString("sys.path.append('.')");
+
+    std::string command = 
+        "import sys\n"
+        "sys.path.append('.')\n"
+        "sys.path.append('" + file_path + "')\n"
+        "for path in sys.path:\n"
+        "    print(path)";
+
+    PyRun_SimpleString(command.c_str());
 
     // Get module and function name from user
     printf("Input script name: ");

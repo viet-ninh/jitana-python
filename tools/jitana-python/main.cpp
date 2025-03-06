@@ -61,39 +61,61 @@ void print_bytecode(PyObject *pFunc) {
     }
 }
 
-void disassemble_function(PyObject *pFunc){
+void disassemble_function(PyObject *pFunc) {
     PyObject *pCode = PyObject_GetAttrString(pFunc, "__code__");
     PyObject *dis_module = PyImport_ImportModule("dis");
 
-    if(pCode && dis_module){
-                // Get the disassembly function from the dis module
-        PyObject *dis_function = PyObject_GetAttrString(dis_module, "dis");
-        if (dis_function && PyCallable_Check(dis_function)) {
-            // Call dis.dis() on the function code object
+    if (pCode && dis_module) {
+        // Get dis.Bytecode from the dis module
+        PyObject *bytecode_class = PyObject_GetAttrString(dis_module, "Bytecode");
+
+        if (bytecode_class && PyCallable_Check(bytecode_class)) {
+            // Create a Bytecode object
             PyObject *args = PyTuple_Pack(1, pCode);
-            std::ofstream file("output/dis code.txt");
-            if (file.is_open()){
-                file << "Bytecode for function: \n";
-                PyObject *result = PyObject_CallObject(dis_function, args); 
-                if (!result) {
-                    PyErr_Print();
-                    fprintf(stderr, "Disassembly failed\n");
-                }
-                file.close();
-                Py_XDECREF(result);
-            }
-            else{
-                std::cerr << "Error: Unable to create file. \n";
-            }
-
-
+            PyObject *bytecode_obj = PyObject_CallObject(bytecode_class, args);
             Py_DECREF(args);
+
+            if (bytecode_obj) {
+                std::ofstream file("output/code_instructions.txt");
+                if (file.is_open()) {
+                    file << "Bytecode for function:\n";
+
+                    // Iterate over Bytecode object (it is an iterable and contains instructions of the program)
+                    PyObject *iterator = PyObject_GetIter(bytecode_obj);
+                    PyObject *instr;
+                    while ((instr = PyIter_Next(iterator))) {
+                        PyObject *repr = PyObject_Repr(instr);
+                        const char *instr_str = PyUnicode_AsUTF8(repr);
+                        file << instr_str << "\n";
+                        Py_DECREF(repr);
+                        Py_DECREF(instr);
+                    }
+                    Py_DECREF(iterator);
+                    file.close();
+                } else {
+                    std::cerr << "Error: Unable to create file.\n";
+                }
+
+                Py_DECREF(bytecode_obj);
+            } else {
+                PyErr_Print();
+                fprintf(stderr, "Failed to create Bytecode object\n");
+            }
+
+            Py_DECREF(bytecode_class);
         } else {
             PyErr_Print();
-            fprintf(stderr, "Failed to find or call dis.dis()\n");
+            fprintf(stderr, "Failed to find or call dis.Bytecode()\n");
         }
+
+        Py_DECREF(dis_module);
+        Py_DECREF(pCode);
+    } else {
+        PyErr_Print();
+        fprintf(stderr, "Failed to retrieve function code object or import dis module\n");
     }
 }
+
 
 int main(int argc, char* argv[]) {
     printf("%s \n", argv[1]);

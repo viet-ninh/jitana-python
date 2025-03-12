@@ -3,10 +3,19 @@
 #include <iostream>
 #include <fstream>
 
+#include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/graphviz.hpp>
+#include <unordered_map>
 
 char script_name[256];
 char func_name[256];
+
+// Define a directed graph using Boost
+using Graph = boost::adjacency_list<boost::vecS, boost::vecS, boost::directedS>;
+
+// Map function names to vertex descriptors
+using Vertex = boost::graph_traits<Graph>::vertex_descriptor;
+using VertexMap = std::unordered_map<std::string, Vertex>;
 
 struct Instruction {
     std::string opname;
@@ -145,6 +154,56 @@ std::vector<Instruction> disassemble_function(PyObject *pFunc) {
     return instructions;
 }
 
+void write_instructions_to_file(const std::vector<Instruction>& instructions, const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: Unable to create file.\n";
+        return;
+    }
+
+    file << "Bytecode Instructions:\n";
+    for (const auto &inst : instructions) {
+        file << inst.opname << " (" << inst.opcode << ")";
+        if (inst.arg != -1) {
+            file << " Arg: " << inst.arg << " ArgVal: " << inst.argval;
+        }
+        file << "\n";
+    }
+    file.close();
+}
+
+void build_function_call_graph(Graph &graph, VertexMap &vertex_map, 
+                               const std::vector<Instruction> &instructions, 
+                               const std::string &function_name) {
+    // Add the main function as a vertex
+    Vertex main_vertex;
+    if (vertex_map.find(function_name) == vertex_map.end()) {
+        main_vertex = boost::add_vertex(graph);
+        vertex_map[function_name] = main_vertex;
+    } else {
+        main_vertex = vertex_map[function_name];
+    }
+
+    // Iterate over instructions to find function calls
+    for (const auto &inst : instructions) {
+        if (inst.opname == "CALL_FUNCTION" || inst.opname == "CALL_METHOD" || inst.opname == "CALL") {
+            std::string called_function = inst.argval; // Function being called
+            
+            // Ensure the function exists as a node
+            Vertex called_vertex;
+            if (vertex_map.find(called_function) == vertex_map.end()) {
+                called_vertex = boost::add_vertex(graph);
+                vertex_map[called_function] = called_vertex;
+            } else {
+                called_vertex = vertex_map[called_function];
+            }
+
+            // Add an edge from the caller to the callee
+            boost::add_edge(main_vertex, called_vertex, graph);
+        }
+    }
+}
+
 
 int main(int argc, char* argv[]) {
     std::string file_path = argv[1];
@@ -172,8 +231,20 @@ int main(int argc, char* argv[]) {
     }
 
     print_bytecode(pFunc);
-    std::vector<Instruction> instructions;
-    instructions = disassemble_function(pFunc);
+    std::vector<Instruction> instructions = disassemble_function(pFunc);
+    write_instructions_to_file(instructions, "output/function_instructions.txt");
+
+    // Create the Boost Graph and a mapping of function names to nodes
+    Graph function_call_graph;
+    VertexMap vertex_map;
+
+    // Build the function call graph
+    build_function_call_graph(function_call_graph, vertex_map, instructions, func_name);
+
+    // (Optional) Output the graph
+    std::ofstream dot_file("output/function_calls.dot");
+    boost::write_graphviz(dot_file, function_call_graph);
+    dot_file.close();
 
     Py_DECREF(pModule);
     Py_DECREF(pFunc);

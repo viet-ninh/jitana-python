@@ -118,16 +118,13 @@ void disassemble_function(PyObject *pFunc) {
 
 
 int main(int argc, char* argv[]) {
-    printf("%s \n", argv[1]);
     std::string file_path = argv[1];
     Py_Initialize();
 
     std::string command = 
         "import sys\n"
         "sys.path.append('.')\n"
-        "sys.path.append('" + file_path + "')\n"
-        "for path in sys.path:\n"
-        "    print(path)";
+        "sys.path.append('" + file_path + "')\n";
 
     PyRun_SimpleString(command.c_str());
 

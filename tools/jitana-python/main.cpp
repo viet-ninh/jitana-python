@@ -10,8 +10,13 @@
 char script_name[256];
 char func_name[256];
 
+// Define a graph with a vertex property for labels
+struct VertexProperties {
+    std::string label;
+};
+
 // Define a directed graph using Boost
-using Graph = boost::adjacency_list<boost::vecS, boost::vecS, boost::directedS>;
+using Graph = boost::adjacency_list<boost::vecS, boost::vecS, boost::directedS, VertexProperties>;
 
 // Map function names to vertex descriptors
 using Vertex = boost::graph_traits<Graph>::vertex_descriptor;
@@ -99,27 +104,23 @@ std::vector<Instruction> disassemble_function(PyObject *pFunc) {
                     Instruction inst;
 
                     PyObject *opname_obj = PyObject_GetAttrString(instr, "opname");
-                    PyObject *opcode_obj = PyObject_GetAttrString(instr, "opcode");
-                    PyObject *arg_obj = PyObject_GetAttrString(instr, "arg");
-                    PyObject *argval_obj = PyObject_GetAttrString(instr, "argval");
-
                     if (opname_obj) {
                         inst.opname = PyUnicode_AsUTF8(opname_obj);
                         Py_DECREF(opname_obj);
                     }
-
+                    PyObject *opcode_obj = PyObject_GetAttrString(instr, "opcode");
                     if (opcode_obj) {
                         inst.opcode = PyLong_AsLong(opcode_obj);
                         Py_DECREF(opcode_obj);
                     }
-
+                    PyObject *arg_obj = PyObject_GetAttrString(instr, "arg");
                     if (arg_obj && PyLong_Check(arg_obj)) {
                         inst.arg = PyLong_AsLong(arg_obj);
                         Py_DECREF(arg_obj);
                     } else {
                         inst.arg = -1;  // Default for no argument
                     }
-
+                    PyObject *argval_obj = PyObject_GetAttrString(instr, "argval");
                     if (argval_obj && PyUnicode_Check(argval_obj)) {
                         inst.argval = PyUnicode_AsUTF8(argval_obj);
                         Py_DECREF(argval_obj);
@@ -150,7 +151,6 @@ std::vector<Instruction> disassemble_function(PyObject *pFunc) {
         PyErr_Print();
         std::cerr << "Failed to retrieve function code object or import dis module\n";
     }
-
     return instructions;
 }
 
@@ -180,26 +180,51 @@ void build_function_call_graph(Graph &graph, VertexMap &vertex_map,
     if (vertex_map.find(function_name) == vertex_map.end()) {
         main_vertex = boost::add_vertex(graph);
         vertex_map[function_name] = main_vertex;
+        graph[main_vertex].label = function_name;
     } else {
         main_vertex = vertex_map[function_name];
     }
 
     // Iterate over instructions to find function calls
-    for (const auto &inst : instructions) {
-        if (inst.opname == "CALL_FUNCTION" || inst.opname == "CALL_METHOD" || inst.opname == "CALL") {
-            std::string called_function = inst.argval; // Function being called
-            
-            // Ensure the function exists as a node
-            Vertex called_vertex;
-            if (vertex_map.find(called_function) == vertex_map.end()) {
-                called_vertex = boost::add_vertex(graph);
-                vertex_map[called_function] = called_vertex;
+    std::string last_global; // Track last LOAD_GLOBAL value for method calls
+
+    for (size_t i = 0; i < instructions.size(); ++i) {
+        const auto &inst = instructions[i];
+
+        if (inst.opname == "LOAD_GLOBAL") {
+            last_global = inst.argval; // Save global variable name (e.g., "np")
+        } 
+
+        else if (inst.opname == "LOAD_ATTR" && !last_global.empty()) {
+            // If LOAD_ATTR follows LOAD_GLOBAL, construct full method name (e.g., "np.sum")
+            last_global += "." + inst.argval;  
+        } 
+
+        else if (inst.opname == "CALL_FUNCTION" || inst.opname == "CALL_METHOD" || inst.opname == "CALL") {
+            std::string called_function;
+
+            // If we just processed a method call, use last_global (e.g., "np.sum")
+            if (!last_global.empty()) {
+                called_function = last_global;
+                last_global.clear(); // Reset tracking for the next iteration
             } else {
-                called_vertex = vertex_map[called_function];
+                called_function = inst.argval;
             }
 
-            // Add an edge from the caller to the callee
-            boost::add_edge(main_vertex, called_vertex, graph);
+            if (!called_function.empty()) {
+                // Ensure the function exists as a node
+                Vertex called_vertex;
+                if (vertex_map.find(called_function) == vertex_map.end()) {
+                    called_vertex = boost::add_vertex(graph);
+                    vertex_map[called_function] = called_vertex;
+                    graph[called_vertex].label = called_function;
+                } else {
+                    called_vertex = vertex_map[called_function];
+                }
+
+                // Add an edge from the caller to the callee
+                boost::add_edge(main_vertex, called_vertex, graph);
+            }
         }
     }
 }
@@ -243,7 +268,8 @@ int main(int argc, char* argv[]) {
 
     // (Optional) Output the graph
     std::ofstream dot_file("output/function_calls.dot");
-    boost::write_graphviz(dot_file, function_call_graph);
+    boost::write_graphviz(dot_file, function_call_graph,
+        boost::make_label_writer(boost::get(&VertexProperties::label, function_call_graph))); 
     dot_file.close();
 
     Py_DECREF(pModule);

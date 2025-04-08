@@ -84,75 +84,130 @@ void print_bytecode(PyObject *pFunc) {
 
 std::vector<Instruction> disassemble_function(PyObject *pFunc) {
     std::vector<Instruction> instructions;
-    
+
+    // Try to get the __code__ object directly
     PyObject *pCode = PyObject_GetAttrString(pFunc, "__code__");
-    PyObject *dis_module = PyImport_ImportModule("dis");
 
-    if (pCode && dis_module) {
-        PyObject *bytecode_class = PyObject_GetAttrString(dis_module, "Bytecode");
+    // If not found, try __func__.__code__ (e.g., for bound methods)
+    if (!pCode) {
+        PyErr_Clear();  // Clear error from failed __code__ access
 
-        if (bytecode_class && PyCallable_Check(bytecode_class)) {
-            PyObject *args = PyTuple_Pack(1, pCode);
-            PyObject *bytecode_obj = PyObject_CallObject(bytecode_class, args);
-            Py_DECREF(args);
-
-            if (bytecode_obj) {
-                PyObject *iterator = PyObject_GetIter(bytecode_obj);
-                PyObject *instr;
-
-                while ((instr = PyIter_Next(iterator))) {
-                    Instruction inst;
-
-                    PyObject *opname_obj = PyObject_GetAttrString(instr, "opname");
-                    if (opname_obj) {
-                        inst.opname = PyUnicode_AsUTF8(opname_obj);
-                        Py_DECREF(opname_obj);
-                    }
-                    PyObject *opcode_obj = PyObject_GetAttrString(instr, "opcode");
-                    if (opcode_obj) {
-                        inst.opcode = PyLong_AsLong(opcode_obj);
-                        Py_DECREF(opcode_obj);
-                    }
-                    PyObject *arg_obj = PyObject_GetAttrString(instr, "arg");
-                    if (arg_obj && PyLong_Check(arg_obj)) {
-                        inst.arg = PyLong_AsLong(arg_obj);
-                        Py_DECREF(arg_obj);
-                    } else {
-                        inst.arg = -1;  // Default for no argument
-                    }
-                    PyObject *argval_obj = PyObject_GetAttrString(instr, "argval");
-                    if (argval_obj && PyUnicode_Check(argval_obj)) {
-                        inst.argval = PyUnicode_AsUTF8(argval_obj);
-                        Py_DECREF(argval_obj);
-                    } else {
-                        inst.argval = "";
-                    }
-
-                    instructions.push_back(inst);
-                    Py_DECREF(instr);
-                }
-
-                Py_DECREF(iterator);
-                Py_DECREF(bytecode_obj);
-            } else {
-                PyErr_Print();
-                std::cerr << "Failed to create Bytecode object\n";
-            }
-
-            Py_DECREF(bytecode_class);
-        } else {
-            PyErr_Print();
-            std::cerr << "Failed to find or call dis.Bytecode()\n";
+        PyObject *pFuncAttr = PyObject_GetAttrString(pFunc, "__func__");
+        if (pFuncAttr) {
+            pCode = PyObject_GetAttrString(pFuncAttr, "__code__");
+            Py_DECREF(pFuncAttr);
         }
+    }
 
+    // If still no code object, give up (likely a built-in or C function)
+    if (!pCode) {
+        std::cerr << "Cannot disassemble: no __code__ object found (likely a built-in or C extension function)\n";
+        PyErr_Clear();  // Clear any error
+        return instructions;
+    }
+
+    // Import dis module
+    PyObject *dis_module = PyImport_ImportModule("dis");
+    if (!dis_module) {
+        std::cerr << "Failed to import 'dis' module\n";
+        Py_DECREF(pCode);
+        PyErr_Print();
+        return instructions;
+    }
+
+    // Get dis.Bytecode class
+    PyObject *bytecode_class = PyObject_GetAttrString(dis_module, "Bytecode");
+    if (!bytecode_class || !PyCallable_Check(bytecode_class)) {
+        std::cerr << "Failed to access or call dis.Bytecode\n";
+        Py_XDECREF(bytecode_class);
         Py_DECREF(dis_module);
         Py_DECREF(pCode);
-    } else {
         PyErr_Print();
-        std::cerr << "Failed to retrieve function code object or import dis module\n";
+        return instructions;
     }
+
+    // Create Bytecode object
+    PyObject *args = PyTuple_Pack(1, pCode);
+    PyObject *bytecode_obj = PyObject_CallObject(bytecode_class, args);
+    Py_DECREF(args);
+    Py_DECREF(bytecode_class);
+    Py_DECREF(dis_module);
+    Py_DECREF(pCode);
+
+    if (!bytecode_obj) {
+        std::cerr << "Failed to create Bytecode object\n";
+        PyErr_Print();
+        return instructions;
+    }
+
+    // Iterate through bytecode instructions
+    PyObject *iterator = PyObject_GetIter(bytecode_obj);
+    Py_DECREF(bytecode_obj);
+
+    if (!iterator) {
+        std::cerr << "Failed to get iterator from Bytecode object\n";
+        PyErr_Print();
+        return instructions;
+    }
+
+    PyObject *instr;
+    while ((instr = PyIter_Next(iterator))) {
+        Instruction inst{};
+
+        // Get opname
+        PyObject *opname_obj = PyObject_GetAttrString(instr, "opname");
+        if (opname_obj) {
+            inst.opname = PyUnicode_AsUTF8(opname_obj);
+            Py_DECREF(opname_obj);
+        }
+
+        // Get opcode
+        PyObject *opcode_obj = PyObject_GetAttrString(instr, "opcode");
+        if (opcode_obj) {
+            inst.opcode = PyLong_AsLong(opcode_obj);
+            Py_DECREF(opcode_obj);
+        }
+
+        // Get arg
+        PyObject *arg_obj = PyObject_GetAttrString(instr, "arg");
+        if (arg_obj && PyLong_Check(arg_obj)) {
+            inst.arg = PyLong_AsLong(arg_obj);
+            Py_DECREF(arg_obj);
+        } else {
+            inst.arg = -1;
+        }
+
+        // Get argval
+        PyObject *argval_obj = PyObject_GetAttrString(instr, "argval");
+        if (argval_obj) {
+            if (PyUnicode_Check(argval_obj)) {
+                inst.argval = PyUnicode_AsUTF8(argval_obj);
+            } else if (PyLong_Check(argval_obj)) {
+                inst.argval = std::to_string(PyLong_AsLong(argval_obj));
+            } else if (argval_obj == Py_None) {
+                inst.argval = "None";
+            } else {
+                PyObject *repr = PyObject_Repr(argval_obj);
+                if (repr) {
+                    inst.argval = PyUnicode_AsUTF8(repr);
+                    Py_DECREF(repr);
+                } else {
+                    inst.argval = "<unknown>";
+                }
+            }
+            Py_DECREF(argval_obj);
+        } else {
+            inst.argval = "";
+        }
+
+        instructions.push_back(inst);
+        Py_DECREF(instr);
+    }
+
+    Py_DECREF(iterator);
     return instructions;
 }
+
 
 void write_instructions_to_file(const std::vector<Instruction>& instructions, const std::string& filename) {
     std::ofstream file(filename);
@@ -255,7 +310,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    print_bytecode(pFunc);
+    // print_bytecode(pFunc);
     std::vector<Instruction> instructions = disassemble_function(pFunc);
     write_instructions_to_file(instructions, "output/function_instructions.txt");
 

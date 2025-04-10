@@ -1,7 +1,10 @@
 #include <python/Python.h>
 #include <stdio.h>
 #include <iostream>
+#include <filesystem>
 #include <fstream>
+#include <set>
+
 
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/graphviz.hpp>
@@ -27,6 +30,7 @@ struct Instruction {
     int opcode;
     int arg;
     std::string argval;
+    std::string source_label;
 };
 
 // Load Python module with a given name
@@ -150,81 +154,181 @@ std::vector<Instruction> disassemble_function(PyObject *pFunc) {
         return instructions;
     }
 
-    PyObject *instr;
+    PyObject* instr;
     while ((instr = PyIter_Next(iterator))) {
         Instruction inst{};
 
-        // Get opname
-        PyObject *opname_obj = PyObject_GetAttrString(instr, "opname");
+        // Get opname (the name of the bytecode instruction, e.g., 'LOAD_FAST', 'CALL_FUNCTION')
+        PyObject* opname_obj = PyObject_GetAttrString(instr, "opname");
         if (opname_obj) {
             inst.opname = PyUnicode_AsUTF8(opname_obj);
             Py_DECREF(opname_obj);
         }
 
-        // Get opcode
-        PyObject *opcode_obj = PyObject_GetAttrString(instr, "opcode");
+        // Get opcode (the opcode value, e.g., 100, 101)
+        PyObject* opcode_obj = PyObject_GetAttrString(instr, "opcode");
         if (opcode_obj) {
             inst.opcode = PyLong_AsLong(opcode_obj);
             Py_DECREF(opcode_obj);
         }
 
-        // Get arg
-        PyObject *arg_obj = PyObject_GetAttrString(instr, "arg");
+        // Get argument (if available, this can vary depending on the opcode)
+        PyObject* arg_obj = PyObject_GetAttrString(instr, "arg");
         if (arg_obj && PyLong_Check(arg_obj)) {
             inst.arg = PyLong_AsLong(arg_obj);
             Py_DECREF(arg_obj);
         } else {
-            inst.arg = -1;
+            inst.arg = -1; // Default value for instructions with no argument
         }
 
-        // Get argval
-        PyObject *argval_obj = PyObject_GetAttrString(instr, "argval");
+        // Get argument value (this can be a string, integer, None, or more complex object)
+        PyObject* argval_obj = PyObject_GetAttrString(instr, "argval");
         if (argval_obj) {
             if (PyUnicode_Check(argval_obj)) {
-                inst.argval = PyUnicode_AsUTF8(argval_obj);
+                inst.argval = PyUnicode_AsUTF8(argval_obj); // If argument is a string
             } else if (PyLong_Check(argval_obj)) {
-                inst.argval = std::to_string(PyLong_AsLong(argval_obj));
+                inst.argval = std::to_string(PyLong_AsLong(argval_obj)); // If argument is an integer
             } else if (argval_obj == Py_None) {
-                inst.argval = "None";
+                inst.argval = "None"; // Handle None type
             } else {
-                PyObject *repr = PyObject_Repr(argval_obj);
+                // If argument is of unknown type, get the string representation
+                PyObject* repr = PyObject_Repr(argval_obj);
                 if (repr) {
                     inst.argval = PyUnicode_AsUTF8(repr);
                     Py_DECREF(repr);
                 } else {
-                    inst.argval = "<unknown>";
+                    inst.argval = "<unknown>"; // Default for unknown types
                 }
             }
             Py_DECREF(argval_obj);
         } else {
-            inst.argval = "";
+            inst.argval = ""; // Default if no argument value is found
         }
 
+        // Add the processed instruction to the list
         instructions.push_back(inst);
-        Py_DECREF(instr);
+        Py_DECREF(instr); // Clean up the current instruction object
     }
 
     Py_DECREF(iterator);
     return instructions;
 }
 
+// Utility to scan backward to find LOAD_GLOBAL (and possibly LOAD_ATTR)
+int find_global_load(const std::vector<Instruction>& instructions, int call_index, std::string& func_name, std::string& full_name) {
+    // Look back up to 5 instructions
+    for (int j = call_index - 1; j >= 0 && call_index - j <= 5; --j) {
+        if (instructions[j].opname == "LOAD_GLOBAL") {
+            func_name = instructions[j].argval;
+            full_name = func_name;  // default
+            if (j + 1 < call_index && instructions[j + 1].opname == "LOAD_ATTR") {
+                full_name += "." + instructions[j + 1].argval;
+            }
+            return j;
+        }
+    }
+    return -1;
+}
 
-void write_instructions_to_file(const std::vector<Instruction>& instructions, const std::string& filename) {
-    std::ofstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error: Unable to create file.\n";
+void disassemble_called_functions_recursive(
+    PyObject* context_function,
+    const std::vector<Instruction>& instructions,
+    std::map<std::string, std::vector<Instruction>>& called_functions,
+    std::set<std::string>& visited
+) {
+    PyObject* globals_dict = PyObject_GetAttrString(context_function, "__globals__");
+    if (!globals_dict) {
+        std::cerr << "Could not get globals from function.\n";
+        PyErr_Print();
         return;
     }
 
-    file << "Bytecode Instructions:\n";
-    for (const auto &inst : instructions) {
-        file << inst.opname << " (" << inst.opcode << ")";
-        if (inst.arg != -1) {
-            file << " Arg: " << inst.arg << " ArgVal: " << inst.argval;
+    for (size_t i = 0; i < instructions.size(); ++i) {
+        const Instruction& inst = instructions[i];
+        if (inst.opname == "CALL" || inst.opname == "CALL_FUNCTION") {
+            std::string func_name, full_name;
+            int load_index = find_global_load(instructions, i, func_name, full_name);
+            if (load_index >= 0 && visited.count(full_name) == 0) {
+                PyObject* target = nullptr;
+
+                PyObject* module_or_func = PyDict_GetItemString(globals_dict, func_name.c_str());
+                if (module_or_func) {
+                    if (full_name != func_name) { // Has attribute, like np.sum
+                        std::string attr = full_name.substr(func_name.length() + 1);
+                        target = PyObject_GetAttrString(module_or_func, attr.c_str());
+                    } else {
+                        target = module_or_func;
+                        Py_INCREF(target);
+                    }
+
+                    if (target && PyCallable_Check(target)) {
+                        std::vector<Instruction> inner = disassemble_function(target);
+                        if (!inner.empty()) {
+                            called_functions[full_name] = inner;
+                            visited.insert(full_name);
+                            disassemble_called_functions_recursive(target, inner, called_functions, visited);
+                        }
+                        Py_DECREF(target);
+                    }
+                }
+            }
         }
-        file << "\n";
+
     }
-    file.close();
+
+    Py_DECREF(globals_dict);
+}
+
+
+std::map<std::string, std::vector<Instruction>> disassemble_all_called_functions(PyObject* original_function, const char* func_name) {
+    std::map<std::string, std::vector<Instruction>> called_functions;
+    std::set<std::string> visited;
+
+    std::vector<Instruction> top_level = disassemble_function(original_function);
+    called_functions[func_name] = top_level;
+    disassemble_called_functions_recursive(original_function, top_level, called_functions, visited);
+    std::cout << "Disassembled functions:\n";
+    for (const auto& entry : called_functions) {
+        std::cout << "Function: " << entry.first << "\n";
+    }
+    return called_functions;
+}
+
+void write_instructions_to_file(
+    const std::map<std::string, std::vector<Instruction>>& instruction_map,
+    const std::string& output_dir
+) {
+    // Create the directory if it doesn't exist
+    if (!std::filesystem::exists(output_dir)) {
+        if (!std::filesystem::create_directories(output_dir)) {
+            std::cerr << "Error: Unable to create output directory.\n";
+            return;
+        }
+    }
+
+    for (const auto& [func_name, instructions] : instruction_map) {
+        // Sanitize filename (replace '.' with '_', etc.)
+        std::string safe_name = func_name;
+        std::replace(safe_name.begin(), safe_name.end(), '.', '_');
+        std::string filename = output_dir + "/" + safe_name + ".txt";
+
+        std::ofstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "Error: Unable to write file for function: " << func_name << "\n";
+            continue;
+        }
+
+        file << "Bytecode Instructions for function: " << func_name << "\n";
+        for (const auto& inst : instructions) {
+            file << inst.opname << " (" << inst.opcode << ")";
+            if (inst.arg != -1) {
+                file << " Arg: " << inst.arg << " ArgVal: " << inst.argval;
+            }
+            file << "\n";
+        }
+
+        file.close();
+    }
 }
 
 void build_function_call_graph(Graph &graph, VertexMap &vertex_map, 
@@ -284,51 +388,146 @@ void build_function_call_graph(Graph &graph, VertexMap &vertex_map,
     }
 }
 
+std::map<std::string, std::shared_ptr<Graph>> write_function_call_graphs_to_dot(
+    const std::string& output_dir,
+    const std::map<std::string, std::vector<Instruction>>& instruction_map
+) {
+    namespace fs = std::filesystem;
 
-int main(int argc, char* argv[]) {
-    std::string file_path = argv[1];
-    Py_Initialize();
+    // Create the directory if it doesn't exist
+    if (!fs::exists(output_dir)) {
+        if (!fs::create_directories(output_dir)) {
+            std::cerr << "Error: Unable to create output directory: " << output_dir << "\n";
+        }
+    }
+    std::map<std::string, std::shared_ptr<Graph>> graph_map;
 
-    std::string command = 
-        "import sys\n"
-        "sys.path.append('.')\n"
-        "sys.path.append('" + file_path + "')\n";
+    for (const auto& [func_name, instructions] : instruction_map) {
+        auto subgraph = std::make_shared<Graph>();
+        VertexMap sub_vertex_map;
 
-    PyRun_SimpleString(command.c_str());
+        build_function_call_graph(*subgraph, sub_vertex_map, instructions, func_name);
 
-    // Get module and function name from user
-    printf("Input script name: ");
-    scanf("%255s", script_name);
-    PyObject *pModule = load_python_module(script_name);
-    if (!pModule) return 1;
+        graph_map[func_name] = subgraph; // store the subgraph
 
-    printf("Input the script's function name: ");
-    scanf("%255s", func_name);
-    PyObject *pFunc = load_python_function(pModule, func_name);
-    if (!pFunc) {
-        Py_DECREF(pModule);
-        return 1;
+        // Create filename
+        std::string safe_func_name = func_name;
+        std::replace(safe_func_name.begin(), safe_func_name.end(), '.', '_');
+        std::string filename = output_dir + "/" + safe_func_name + "_calls.dot";
+
+        std::ofstream dot_file(filename);
+        if (!dot_file) {
+            std::cerr << "Error: Could not write to file " << filename << "\n";
+            continue;
+        }
+
+        boost::write_graphviz(dot_file, *subgraph,
+            boost::make_label_writer(boost::get(&VertexProperties::label, *subgraph)));
+        dot_file.close();
+    }
+    return graph_map;
+}
+
+std::string resolve_called_function(const Instruction& instr) {
+    return instr.argval; // Or whatever field holds the target function name
+}
+
+
+Graph combine_all_function_graphs(
+    const std::map<std::string, std::shared_ptr<Graph>>& graph_map,
+    const std::map<std::string, std::vector<Instruction>>& instruction_map,
+    const std::string& output_file
+) {
+    Graph master_graph;
+
+    // NEW: Track label-to-vertex mapping for inter-graph links
+    // STEP 1: Copy subgraphs and deduplicate by label
+    std::unordered_map<std::string, Vertex> label_to_vertex;
+
+    for (const auto& [func_name, subgraph_ptr] : graph_map) {
+        const Graph& subgraph = *subgraph_ptr;
+        std::unordered_map<Vertex, Vertex> vertex_map;
+
+        for (auto [vi, vi_end] = boost::vertices(subgraph); vi != vi_end; ++vi) {
+            const std::string& label = subgraph[*vi].label;
+
+            Vertex new_v;
+            if (label_to_vertex.find(label) == label_to_vertex.end()) {
+                new_v = boost::add_vertex(master_graph);
+                master_graph[new_v].label = label;
+                label_to_vertex[label] = new_v;
+            } else {
+                new_v = label_to_vertex[label];
+            }
+
+            vertex_map[*vi] = new_v;
+        }
+
+        for (auto [ei, ei_end] = boost::edges(subgraph); ei != ei_end; ++ei) {
+            Vertex src = boost::source(*ei, subgraph);
+            Vertex tgt = boost::target(*ei, subgraph);
+            boost::add_edge(vertex_map[src], vertex_map[tgt], master_graph);
+        }
     }
 
-    // print_bytecode(pFunc);
-    std::vector<Instruction> instructions = disassemble_function(pFunc);
-    write_instructions_to_file(instructions, "output/function_instructions.txt");
 
-    // Create the Boost Graph and a mapping of function names to nodes
-    Graph function_call_graph;
-    VertexMap vertex_map;
+    // STEP 3: Write to DOT file
+    std::ofstream dot_file(output_file);
+    if (!dot_file) {
+        std::cerr << "Error: could not open file for writing: " << output_file << "\n";
+    } else {
+        boost::write_graphviz(dot_file,
+            master_graph,
+            boost::make_label_writer(boost::get(&VertexProperties::label, master_graph)));
+        dot_file.close();
+    }
 
-    // Build the function call graph
-    build_function_call_graph(function_call_graph, vertex_map, instructions, func_name);
+    return master_graph;
+}
 
-    // (Optional) Output the graph
-    std::ofstream dot_file("output/function_calls.dot");
-    boost::write_graphviz(dot_file, function_call_graph,
-        boost::make_label_writer(boost::get(&VertexProperties::label, function_call_graph))); 
-    dot_file.close();
 
-    Py_DECREF(pModule);
-    Py_DECREF(pFunc);
-    Py_Finalize();
-    return 0;
+int main(int argc, char* argv[]) {
+    if (argc > 1){
+        std::string file_path = argv[1];
+        Py_Initialize();
+
+        std::string command = 
+            "import sys\n"
+            "sys.path.append('.')\n"
+            "sys.path.append('" + file_path + "')\n";
+
+        PyRun_SimpleString(command.c_str());
+
+        // Get module and function name from user
+        printf("Input script name: ");
+        scanf("%255s", script_name);
+        PyObject *pModule = load_python_module(script_name);
+        if (!pModule) return 1;
+
+        printf("Input the script's function name: ");
+        scanf("%255s", func_name);
+        PyObject *pFunc = load_python_function(pModule, func_name);
+        if (!pFunc) {
+            Py_DECREF(pModule);
+            return 1;
+        }
+
+        // Create a dictionary of instructions where each function name is the key to its bytecode instructions
+        std::map<std::string, std::vector<Instruction>> instruction_map = disassemble_all_called_functions(pFunc, func_name);
+        write_instructions_to_file(instruction_map, "output/bytecodes");
+
+        std::map<std::string, std::shared_ptr<Graph>> graph_map = write_function_call_graphs_to_dot("output/graphs", instruction_map);
+
+        Graph master_graph = combine_all_function_graphs(graph_map, instruction_map, "output/master_graph.dot");
+
+        Py_DECREF(pModule);
+        Py_DECREF(pFunc);
+        Py_Finalize();
+        return 0;
+    }
+    else{
+        printf("Please run the program with the script directory as an argument.\n");
+        return -1;
+    }
+
 }

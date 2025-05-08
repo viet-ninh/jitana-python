@@ -412,36 +412,47 @@ void build_function_call_graph(Graph &graph, VertexMap &vertex_map,
     }
 
     // Iterate over instructions to find function calls
-std::vector<std::string> callable_stack;
+    std::string last_global; // Track last LOAD_GLOBAL value for method calls
 
-for (size_t i = 0; i < instructions.size(); ++i) {
-    const auto &inst = instructions[i];
+    for (size_t i = 0; i < instructions.size(); ++i) {
+        const auto &inst = instructions[i];
 
-    if (inst.opname == "LOAD_GLOBAL") {
-        callable_stack.push_back(inst.argval);  // e.g., "sqrtm"
-    }
-    else if (inst.opname == "CALL" || inst.opname == "CALL_FUNCTION" || inst.opname == "CALL_METHOD" || inst.opname == "CALL_KW") {
-        if (!callable_stack.empty()) {
-            std::string called_function = callable_stack.back();
-            callable_stack.pop_back();
+        if (inst.opname == "LOAD_GLOBAL") {
+            last_global = inst.argval; // Save global variable name (e.g., "np")
+        } 
 
-            Vertex called_vertex;
-            if (vertex_map.find(called_function) == vertex_map.end()) {
-                called_vertex = boost::add_vertex(graph);
-                vertex_map[called_function] = called_vertex;
-                graph[called_vertex].label = called_function;
+        else if (inst.opname == "LOAD_ATTR" && !last_global.empty()) {
+            // If LOAD_ATTR follows LOAD_GLOBAL, construct full method name (e.g., "np.sum")
+            last_global += "." + inst.argval;  
+        } 
+
+        else if (inst.opname == "CALL_FUNCTION" || inst.opname == "CALL_METHOD" || inst.opname == "CALL") {
+            std::string called_function;
+
+            // If we just processed a method call, use last_global (e.g., "np.sum")
+            if (!last_global.empty()) {
+                called_function = last_global;
+                last_global.clear(); // Reset tracking for the next iteration
             } else {
-                called_vertex = vertex_map[called_function];
+                called_function = inst.argval;
             }
 
-            boost::add_edge(main_vertex, called_vertex, graph);
+            if (!called_function.empty()) {
+                // Ensure the function exists as a node
+                Vertex called_vertex;
+                if (vertex_map.find(called_function) == vertex_map.end()) {
+                    called_vertex = boost::add_vertex(graph);
+                    vertex_map[called_function] = called_vertex;
+                    graph[called_vertex].label = called_function;
+                } else {
+                    called_vertex = vertex_map[called_function];
+                }
+
+                // Add an edge from the caller to the callee
+                boost::add_edge(main_vertex, called_vertex, graph);
+            }
         }
     }
-
-    // Optional: Clear if unrelated op
-    // else if (...) { callable_stack.clear(); }
-}
-
 }
 
 std::map<std::string, std::shared_ptr<Graph>> write_function_call_graphs_to_dot(

@@ -12,14 +12,19 @@
 
 char script_name[256];
 char func_name[256];
+char class_name[256];
 
 // Define a graph with a vertex property for labels
 struct VertexProperties {
     std::string label;
 };
 
+struct EdgeProperties{
+    std:: string label;
+};
+
 // Define a directed graph using Boost
-using Graph = boost::adjacency_list<boost::vecS, boost::vecS, boost::directedS, VertexProperties>;
+using Graph = boost::adjacency_list<boost::vecS, boost::vecS, boost::directedS, VertexProperties, EdgeProperties>;
 
 // Map function names to vertex descriptors
 using Vertex = boost::graph_traits<Graph>::vertex_descriptor;
@@ -56,6 +61,68 @@ PyObject* load_python_function(PyObject *pModule, const char* func_name) {
         return NULL;
     }
     return pFunc;
+}
+
+PyObject* load_class_function(PyObject* pModule, const char* class_name, const char* method_name) {
+    PyObject* pClass = PyObject_GetAttrString(pModule, class_name);
+    if (!pClass || !PyType_Check(pClass)) {
+        PyErr_Print();
+        std::cerr << "Class " << class_name << " not found or not a class.\n";
+        Py_XDECREF(pClass);
+        return nullptr;
+    }
+
+    PyObject* pFunc = PyObject_GetAttrString(pClass, method_name);
+    Py_DECREF(pClass);
+
+    if (!pFunc || !PyCallable_Check(pFunc)) {
+        PyErr_Print();
+        std::cerr << "Method " << method_name << " not found or not callable.\n";
+        Py_XDECREF(pFunc);
+        return nullptr;
+    }
+
+    return pFunc;
+}
+
+void find_classes_and_functions(PyObject* pModule, std::vector<std::string>& classes, std::vector<std::string>& functions) {
+    PyObject* attrs = PyObject_Dir(pModule);
+    Py_ssize_t len = PyList_Size(attrs);
+
+    for (Py_ssize_t i = 0; i < len; ++i) {
+        PyObject* attrName = PyList_GetItem(attrs, i);  // borrowed
+        const char* attrStr = PyUnicode_AsUTF8(attrName);
+        PyObject* attr = PyObject_GetAttr(pModule, attrName);
+
+        if (attr) {
+            if (PyType_Check(attr)) {
+                classes.push_back(attrStr);
+            } else if (PyFunction_Check(attr)) {
+                functions.push_back(attrStr);
+            }
+            Py_DECREF(attr);
+        }
+    }
+    Py_DECREF(attrs);
+}
+
+void list_class_methods(PyObject* pClass, std::vector<std::string>& methods) {
+    PyObject* dirList = PyObject_Dir(pClass);
+    Py_ssize_t len = PyList_Size(dirList);
+
+    for (Py_ssize_t i = 0; i < len; ++i) {
+        PyObject* attrName = PyList_GetItem(dirList, i);  // borrowed
+        const char* attrStr = PyUnicode_AsUTF8(attrName);
+        PyObject* attr = PyObject_GetAttr(pClass, attrName);  // new reference
+
+        if (attr && PyCallable_Check(attr)) {
+            methods.push_back(attrStr);
+        }
+
+        Py_XDECREF(attr);
+    }
+
+    Py_DECREF(dirList);
 }
 
 // Print the bytecode of a function
@@ -345,47 +412,36 @@ void build_function_call_graph(Graph &graph, VertexMap &vertex_map,
     }
 
     // Iterate over instructions to find function calls
-    std::string last_global; // Track last LOAD_GLOBAL value for method calls
+std::vector<std::string> callable_stack;
 
-    for (size_t i = 0; i < instructions.size(); ++i) {
-        const auto &inst = instructions[i];
+for (size_t i = 0; i < instructions.size(); ++i) {
+    const auto &inst = instructions[i];
 
-        if (inst.opname == "LOAD_GLOBAL") {
-            last_global = inst.argval; // Save global variable name (e.g., "np")
-        } 
+    if (inst.opname == "LOAD_GLOBAL") {
+        callable_stack.push_back(inst.argval);  // e.g., "sqrtm"
+    }
+    else if (inst.opname == "CALL" || inst.opname == "CALL_FUNCTION" || inst.opname == "CALL_METHOD" || inst.opname == "CALL_KW") {
+        if (!callable_stack.empty()) {
+            std::string called_function = callable_stack.back();
+            callable_stack.pop_back();
 
-        else if (inst.opname == "LOAD_ATTR" && !last_global.empty()) {
-            // If LOAD_ATTR follows LOAD_GLOBAL, construct full method name (e.g., "np.sum")
-            last_global += "." + inst.argval;  
-        } 
-
-        else if (inst.opname == "CALL_FUNCTION" || inst.opname == "CALL_METHOD" || inst.opname == "CALL") {
-            std::string called_function;
-
-            // If we just processed a method call, use last_global (e.g., "np.sum")
-            if (!last_global.empty()) {
-                called_function = last_global;
-                last_global.clear(); // Reset tracking for the next iteration
+            Vertex called_vertex;
+            if (vertex_map.find(called_function) == vertex_map.end()) {
+                called_vertex = boost::add_vertex(graph);
+                vertex_map[called_function] = called_vertex;
+                graph[called_vertex].label = called_function;
             } else {
-                called_function = inst.argval;
+                called_vertex = vertex_map[called_function];
             }
 
-            if (!called_function.empty()) {
-                // Ensure the function exists as a node
-                Vertex called_vertex;
-                if (vertex_map.find(called_function) == vertex_map.end()) {
-                    called_vertex = boost::add_vertex(graph);
-                    vertex_map[called_function] = called_vertex;
-                    graph[called_vertex].label = called_function;
-                } else {
-                    called_vertex = vertex_map[called_function];
-                }
-
-                // Add an edge from the caller to the callee
-                boost::add_edge(main_vertex, called_vertex, graph);
-            }
+            boost::add_edge(main_vertex, called_vertex, graph);
         }
     }
+
+    // Optional: Clear if unrelated op
+    // else if (...) { callable_stack.clear(); }
+}
+
 }
 
 std::map<std::string, std::shared_ptr<Graph>> write_function_call_graphs_to_dot(
@@ -429,13 +485,12 @@ std::map<std::string, std::shared_ptr<Graph>> write_function_call_graphs_to_dot(
 }
 
 std::string resolve_called_function(const Instruction& instr) {
-    return instr.argval; // Or whatever field holds the target function name
+    return instr.argval;
 }
 
 
 Graph combine_all_function_graphs(
     const std::map<std::string, std::shared_ptr<Graph>>& graph_map,
-    const std::map<std::string, std::vector<Instruction>>& instruction_map,
     const std::string& output_file
 ) {
     Graph master_graph;
@@ -502,28 +557,77 @@ int main(int argc, char* argv[]) {
         printf("Input script name: ");
         scanf("%255s", script_name);
         PyObject *pModule = load_python_module(script_name);
-        if (!pModule) return 1;
-
-        printf("Input the script's function name: ");
-        scanf("%255s", func_name);
-        PyObject *pFunc = load_python_function(pModule, func_name);
-        if (!pFunc) {
-            Py_DECREF(pModule);
+        if (!pModule){
+            Py_Finalize();
             return 1;
         }
+        std::vector<std::string> classes;
+        std::vector<std::string> functions;
+        find_classes_and_functions(pModule, classes, functions);
 
-        // Create a dictionary of instructions where each function name is the key to its bytecode instructions
-        std::map<std::string, std::vector<Instruction>> instruction_map = disassemble_all_called_functions(pFunc, func_name);
-        write_instructions_to_file(instruction_map, "output/bytecodes");
 
-        std::map<std::string, std::shared_ptr<Graph>> graph_map = write_function_call_graphs_to_dot("output/graphs", instruction_map);
+        std::cout << "\nAvailable classes:\n";
+        for (const auto& cls : classes) std::cout << "  - " << cls << "\n";
+        std::cout << "Available functions:\n";
+        for (const auto& func : functions) std::cout << "  - " << func << "\n";
 
-        Graph master_graph = combine_all_function_graphs(graph_map, instruction_map, "output/master_graph.dot");
+        std::string choice;
+        std::cout << "\nAnalyze a [class] method or [function]? ";
+        std::cin >> choice;
 
-        Py_DECREF(pModule);
-        Py_DECREF(pFunc);
-        Py_Finalize();
-        return 0;
+        PyObject* pFunc = nullptr;
+
+        if (choice == "function") {
+            std::cout << "Enter function name: ";
+            std::cin >> func_name;
+            pFunc = load_python_function(pModule, func_name);
+        } else if (choice == "class") {
+            std::cout << "Enter class name: ";
+            std::cin >> class_name;
+
+            PyObject* pClass = PyObject_GetAttrString(pModule, class_name);
+            if (!pClass || !PyType_Check(pClass)) {
+                PyErr_Print();
+                std::cerr << "Invalid class.\n";
+                Py_XDECREF(pClass);
+            } else {
+                std::vector<std::string> class_methods;
+                list_class_methods(pClass, class_methods);
+
+                std::cout << "Methods in class " << class_name << ":\n";
+                for (const auto& method : class_methods)
+                    std::cout << "  - " << method << "\n";
+
+                std::cout << "Enter method name: ";
+                std::cin >> func_name;
+
+                pFunc = PyObject_GetAttrString(pClass, func_name);
+                if (!pFunc || !PyCallable_Check(pFunc)) {
+                    PyErr_Print();
+                    std::cerr << "Method not found or not callable.\n";
+                    Py_XDECREF(pFunc);
+                }
+
+                Py_DECREF(pClass);
+            }
+    } else {
+        std::cerr << "Invalid choice.\n";
+    }
+
+        if (pFunc){
+            // Create a dictionary of instructions where each function name is the key to its bytecode instructions
+            std::map<std::string, std::vector<Instruction>> instruction_map = disassemble_all_called_functions(pFunc, func_name);
+            write_instructions_to_file(instruction_map, "output/bytecodes");
+
+            std::map<std::string, std::shared_ptr<Graph>> graph_map = write_function_call_graphs_to_dot("output/graphs", instruction_map);
+
+            Graph master_graph = combine_all_function_graphs(graph_map, "output/master_graph.dot");
+
+            Py_DECREF(pModule);
+            Py_DECREF(pFunc);
+            Py_Finalize();
+            return 0;
+        }
     }
     else{
         printf("Please run the program with the script directory as an argument.\n");

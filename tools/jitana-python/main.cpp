@@ -20,7 +20,7 @@ struct VertexProperties {
 };
 
 struct EdgeProperties{
-    std:: string label;
+    int call_count = 1; 
 };
 
 // Define a directed graph using Boost
@@ -412,47 +412,46 @@ void build_function_call_graph(Graph &graph, VertexMap &vertex_map,
     }
 
     // Iterate over instructions to find function calls
-    std::string last_global; // Track last LOAD_GLOBAL value for method calls
+ std::vector<std::string> callable_stack;
 
-    for (size_t i = 0; i < instructions.size(); ++i) {
-        const auto &inst = instructions[i];
+for (size_t i = 0; i < instructions.size(); ++i) {
+    const auto &inst = instructions[i];
 
-        if (inst.opname == "LOAD_GLOBAL") {
-            last_global = inst.argval; // Save global variable name (e.g., "np")
-        } 
+    if (inst.opname == "LOAD_GLOBAL") {
+        callable_stack.push_back(inst.argval);
+    }
+    else if (inst.opname == "CALL" || inst.opname == "CALL_FUNCTION" || inst.opname == "CALL_METHOD" || inst.opname == "CALL_KW") {
+        if (!callable_stack.empty()) {
+            std::string called_function = callable_stack.back();
+            callable_stack.pop_back();
 
-        else if (inst.opname == "LOAD_ATTR" && !last_global.empty()) {
-            // If LOAD_ATTR follows LOAD_GLOBAL, construct full method name (e.g., "np.sum")
-            last_global += "." + inst.argval;  
-        } 
-
-        else if (inst.opname == "CALL_FUNCTION" || inst.opname == "CALL_METHOD" || inst.opname == "CALL") {
-            std::string called_function;
-
-            // If we just processed a method call, use last_global (e.g., "np.sum")
-            if (!last_global.empty()) {
-                called_function = last_global;
-                last_global.clear(); // Reset tracking for the next iteration
+            Vertex called_vertex;
+            if (vertex_map.find(called_function) == vertex_map.end()) {
+                called_vertex = boost::add_vertex(graph);
+                vertex_map[called_function] = called_vertex;
+                graph[called_vertex].label = called_function;
             } else {
-                called_function = inst.argval;
+                called_vertex = vertex_map[called_function];
             }
 
-            if (!called_function.empty()) {
-                // Ensure the function exists as a node
-                Vertex called_vertex;
-                if (vertex_map.find(called_function) == vertex_map.end()) {
-                    called_vertex = boost::add_vertex(graph);
-                    vertex_map[called_function] = called_vertex;
-                    graph[called_vertex].label = called_function;
-                } else {
-                    called_vertex = vertex_map[called_function];
-                }
+            // boost::add_edge(main_vertex, called_vertex, graph);
+            auto edge_pair = boost::edge(main_vertex, called_vertex, graph);
 
-                // Add an edge from the caller to the callee
-                boost::add_edge(main_vertex, called_vertex, graph);
+            if (edge_pair.second) {
+                // Edge exists — increment count
+                graph[edge_pair.first].call_count += 1;
+            } else {
+                // Edge doesn't exist — create it with call_count = 1
+                auto e = boost::add_edge(main_vertex, called_vertex, graph).first;
+                graph[e].call_count = 1;
             }
         }
     }
+
+    // Optional: Clear if unrelated op
+    // else if (...) { callable_stack.clear(); }
+}
+
 }
 
 std::map<std::string, std::shared_ptr<Graph>> write_function_call_graphs_to_dot(
@@ -488,8 +487,11 @@ std::map<std::string, std::shared_ptr<Graph>> write_function_call_graphs_to_dot(
             continue;
         }
 
-        boost::write_graphviz(dot_file, *subgraph,
-            boost::make_label_writer(boost::get(&VertexProperties::label, *subgraph)));
+        boost::write_graphviz(
+            dot_file, *subgraph,
+            boost::make_label_writer(boost::get(&VertexProperties::label, *subgraph)),
+            boost::make_label_writer(boost::get(&EdgeProperties::call_count, *subgraph))
+        );
         dot_file.close();
     }
     return graph_map;
@@ -532,7 +534,14 @@ Graph combine_all_function_graphs(
         for (auto [ei, ei_end] = boost::edges(subgraph); ei != ei_end; ++ei) {
             Vertex src = boost::source(*ei, subgraph);
             Vertex tgt = boost::target(*ei, subgraph);
-            boost::add_edge(vertex_map[src], vertex_map[tgt], master_graph);
+            EdgeProperties props = subgraph[*ei];
+            auto [new_edge, inserted] = boost::add_edge(vertex_map[src], vertex_map[tgt], master_graph);
+
+            if (inserted) {
+                master_graph[new_edge].call_count = props.call_count;
+            } else {
+                master_graph[new_edge].call_count += props.call_count;
+            }
         }
     }
 
@@ -542,9 +551,11 @@ Graph combine_all_function_graphs(
     if (!dot_file) {
         std::cerr << "Error: could not open file for writing: " << output_file << "\n";
     } else {
-        boost::write_graphviz(dot_file,
-            master_graph,
-            boost::make_label_writer(boost::get(&VertexProperties::label, master_graph)));
+        boost::write_graphviz(
+            dot_file, master_graph,
+            boost::make_label_writer(boost::get(&VertexProperties::label, master_graph)),
+            boost::make_label_writer(boost::get(&EdgeProperties::call_count, master_graph))
+        );
         dot_file.close();
     }
 

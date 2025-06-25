@@ -439,12 +439,26 @@ std::pair<int, int> get_instruction_stack_effect(const Instruction& inst) {
     } else if (opname == "UNPACK_SEQUENCE" || opname == "UNPACK_EX") {
         return {1, oparg};
     }
-    // Call operations are complex and often handled by specific call site analysis,
-    // as their net effect depends on argument preparation.
-    // As per your original comment and previous discussion, leaving as 0,0 here
-    // for generic stack effect, with special handling elsewhere for argument pops.
-    else if (opname.rfind("CALL", 0) == 0) {
-        return {0, 0};
+    // Corrected Call operations stack effects
+    else if (opname == "CALL_FUNCTION" || opname == "CALL") {
+        // Pops N arguments + 1 callable, pushes 1 return value
+        return {inst.arg + 1, 1};
+    } else if (opname == "CALL_METHOD") {
+        // Pops N arguments + 1 callable + 1 (for PUSH_NULL/self), pushes 1 return value
+        // Note: CALL_METHOD (Py 3.8-3.10) pops N args + 1 method object.
+        // For Py 3.11+, LOAD_METHOD + PUSH_NULL + CALL is common.
+        // If it's a real CALL_METHOD, it's 1 (method) + N (args).
+        return {inst.arg + 1, 1};
+    } else if (opname == "CALL_KW" || opname == "CALL_FUNCTION_KW") {
+        // Pops N total args + 1 kwnames_tuple + 1 callable, pushes 1 return value
+        return {inst.arg + 1 + 1, 1}; // inst.arg is N args, +1 for kwnames, +1 for callable
+    } else if (opname == "CALL_FUNCTION_EX") {
+        // Pops 1 args tuple (+1 kwargs dict if arg & 0x01) + 1 callable, pushes 1 return value
+        int pops = 1 + 1; // 1 args tuple + 1 callable
+        if (inst.arg & 0x01) { // HAS_KEYWORDS flag
+            pops += 1; // +1 kwargs dict
+        }
+        return {pops, 1};
     }
 
 
@@ -727,7 +741,12 @@ void disassemble_called_functions_recursive(
                                 visited.insert(called_func_identifier);
                             }
                         } else {
-                            std::cout << "Object " << called_func_identifier << " is callable but not a standard Python function/method or C function. Skipping." << std::endl;
+                            std::cout << "Object " << called_func_identifier << " is callable but not a standard Python function/method or C function. Adding to graph as unresolved." << std::endl;
+                            // Add to called_functions map with empty instructions to ensure it's included in graph processing
+                            if (called_functions.find(called_func_identifier) == called_functions.end()) {
+                                called_functions[called_func_identifier] = {}; // Mark as unresolved/non-disassemblable
+                            }
+                            visited.insert(called_func_identifier); // Mark as visited to prevent reprocessing
                         }
                     } else {
                         // std::cout << "Resolved target " << called_func_identifier << " is not callable." << std::endl;
@@ -765,6 +784,12 @@ void disassemble_called_functions_recursive(
                                 called_functions[potential_direct_call_name] = {};
                                 visited.insert(potential_direct_call_name);
                             }
+                        } else {
+                            std::cout << "Fallback target " << potential_direct_call_name << " is callable but not standard func/method/C. Adding to graph." << std::endl;
+                            if (called_functions.find(potential_direct_call_name) == called_functions.end()) {
+                                called_functions[potential_direct_call_name] = {}; // Mark as unresolved
+                            }
+                            visited.insert(potential_direct_call_name);
                         }
                         Py_DECREF(fallback_target);
                      } else if (!fallback_target && called_functions.find(potential_direct_call_name) == called_functions.end()) {

@@ -31,12 +31,43 @@ using Vertex = boost::graph_traits<Graph>::vertex_descriptor;
 using VertexMap = std::unordered_map<std::string, Vertex>;
 
 struct Instruction {
+    int offset;
     std::string opname;
     int opcode;
     int arg;
     std::string argval;
-    std::string source_label; // Not explicitly used in current logic, but good for future
+    std::string source_label; 
 };
+
+// Properties for a Dependency Graph Node
+struct DependencyNode {
+    std::string name;
+    std::string type; // "File" or "Library"
+    std::string color; // For Graphviz visualization
+};
+
+// Properties for a Control Flow Graph (CFG)
+struct BasicBlock {
+    int id = -1;
+    int start_offset = -1;
+    std::vector<Instruction> instructions;
+};
+
+struct ControlFlowEdge {
+    std::string label; // e.g., "True", "False", "Unconditional", "Sequential"
+};
+
+// Edges don't need properties for this graph
+using DependencyGraph = boost::adjacency_list<boost::vecS, boost::vecS, boost::directedS, DependencyNode>;
+using DependencyVertex = boost::graph_traits<DependencyGraph>::vertex_descriptor;
+
+using ControlFlowGraph = boost::adjacency_list<boost::vecS, boost::vecS, boost::directedS, BasicBlock, ControlFlowEdge>;
+using CFGVertex = boost::graph_traits<ControlFlowGraph>::vertex_descriptor;
+
+// Helper function to generate a CFG from a list of instructions
+bool is_jump_instruction(const std::string& opname) {
+    return opname.find("JUMP") != std::string::npos;
+}
 
 // Load Python module with a given name
 PyObject* load_python_module(const char* module_name){
@@ -276,6 +307,14 @@ std::vector<Instruction> disassemble_function(PyObject *pFunc) {
             current_inst.opname = PyUnicode_AsUTF8(opname_obj);
             Py_DECREF(opname_obj);
         }
+
+        PyObject* offset_obj = PyObject_GetAttrString(instr_obj, "offset");
+        if (offset_obj && PyLong_Check(offset_obj)) {
+            current_inst.offset = PyLong_AsLong(offset_obj);
+        } else {
+            current_inst.offset = -1; // Should not happen for valid instructions
+        }
+        Py_XDECREF(offset_obj);
 
         PyObject* opcode_obj = PyObject_GetAttrString(instr_obj, "opcode");
         if (opcode_obj && PyLong_Check(opcode_obj)) {
@@ -544,7 +583,7 @@ int find_callable_info_stack_based(
     attr_name_out.clear();
     full_name_out.clear();
 
-    if (call_instruction_idx <= 0 || call_instruction_idx >= instructions.size()) {
+    if (call_instruction_idx <= 0 || static_cast<size_t>(call_instruction_idx) >= instructions.size()) {
         return -1;
     }
 
@@ -820,6 +859,264 @@ std::map<std::string, std::vector<Instruction>> disassemble_all_called_functions
     }
     std::cout << "--- End Summary ---" << std::endl;
     return all_called_functions;
+}
+
+// Main function to generate a CFG from a list of instructions
+ControlFlowGraph generate_cfg_from_instructions(const std::vector<Instruction>& instructions) {
+    ControlFlowGraph cfg;
+    if (instructions.empty()) {
+        return cfg;
+    }
+
+    // Map from an instruction's byte offset to its index in our vector
+    std::map<int, int> offset_to_index;
+    for (size_t i = 0; i < instructions.size(); ++i) {
+        offset_to_index[instructions[i].offset] = i;
+    }
+
+    // --- PASS 1: Find leader offsets ---
+    // A leader is the first instruction of a basic block.
+    std::set<int> leader_offsets;
+    leader_offsets.insert(instructions.front().offset); // The first instruction is always a leader
+
+    for (size_t i = 0; i < instructions.size(); ++i) {
+        const auto& instr = instructions[i];
+        if (is_jump_instruction(instr.opname)) {
+            // The target of a jump is a leader
+            int target_offset = std::stoi(instr.argval);
+            if (offset_to_index.count(target_offset)) {
+                leader_offsets.insert(target_offset);
+            }
+            
+            // The instruction immediately following a jump is also a leader
+            if (i + 1 < instructions.size()) {
+                leader_offsets.insert(instructions[i + 1].offset);
+            }
+        }
+        // Also consider RETURN_VALUE or other block-ending instructions
+        else if (instr.opname == "RETURN_VALUE" || instr.opname == "RETURN_CONST") {
+             if (i + 1 < instructions.size()) {
+                leader_offsets.insert(instructions[i + 1].offset);
+            }
+        }
+    }
+
+    // --- PASS 2: Create basic blocks (nodes) ---
+    if (leader_offsets.empty()) return cfg;
+
+    std::map<int, CFGVertex> block_start_to_vertex;
+    int block_id_counter = 0;
+    for (int offset : leader_offsets) {
+        CFGVertex v = boost::add_vertex(cfg);
+        cfg[v].id = block_id_counter++;
+        cfg[v].start_offset = offset;
+        block_start_to_vertex[offset] = v;
+    }
+
+    // Populate blocks with their instructions
+    for (const auto& instr : instructions) {
+        auto it = leader_offsets.upper_bound(instr.offset);
+        int leader_for_this_instr = *(--it);
+        CFGVertex v = block_start_to_vertex[leader_for_this_instr];
+        cfg[v].instructions.push_back(instr);
+    }
+    
+    // --- PASS 3: Create Edges ---
+    for (const auto& pair : block_start_to_vertex) {
+        int offset = pair.first;
+        CFGVertex u = pair.second;
+
+        const Instruction& last_instr = cfg[u].instructions.back();
+
+        if (is_jump_instruction(last_instr.opname)) {
+            int target_offset = std::stoi(last_instr.argval);
+            if (block_start_to_vertex.count(target_offset)) {
+                CFGVertex v_target = block_start_to_vertex[target_offset];
+                auto edge = boost::add_edge(u, v_target, cfg).first;
+                // Distinguish conditional from unconditional jumps
+                if (last_instr.opname.find("POP_JUMP") != std::string::npos) {
+                     cfg[edge].label = std::string("Jump (if ") + (last_instr.opname.find("FALSE") != std::string::npos ? "False" : "True") + ")";
+                } else {
+                     cfg[edge].label = "Unconditional";
+                }
+            }
+            
+            // For conditional jumps, add the fall-through edge
+            if (last_instr.opname.rfind("POP_JUMP", 0) == 0) {
+                 auto next_leader_it = leader_offsets.find(offset);
+                 if(next_leader_it != leader_offsets.end() && ++next_leader_it != leader_offsets.end()){
+                     CFGVertex v_fallthrough = block_start_to_vertex[*next_leader_it];
+                     auto edge = boost::add_edge(u, v_fallthrough, cfg).first;
+                     cfg[edge].label = std::string("Fall-through (if ") + (last_instr.opname.find("FALSE") != std::string::npos ? "True" : "False") + ")";
+                 }
+            }
+
+        } else if (last_instr.opname != "RETURN_VALUE" && last_instr.opname != "RETURN_CONST" && last_instr.opname.rfind("RAISE", 0) != 0) {
+            // Not a jump or return, so it's a sequential flow to the next block
+            auto next_leader_it = leader_offsets.find(offset);
+            if (next_leader_it != leader_offsets.end() && ++next_leader_it != leader_offsets.end()) {
+                CFGVertex v_next = block_start_to_vertex[*next_leader_it];
+                auto edge = boost::add_edge(u, v_next, cfg).first;
+                cfg[edge].label = "Sequential";
+            }
+        }
+    }
+
+    return cfg;
+}
+
+// New function to write the generated CFG to a .dot file
+void write_cfg_to_dot(const std::string& filename, const ControlFlowGraph& cfg, const std::string& func_name) {
+    std::ofstream dot_file(filename);
+    if (!dot_file) {
+        std::cerr << "Error: Unable to open " << filename << " for writing.\n";
+        return;
+    }
+
+    // --- FIX IS HERE ---
+    // Sanitize the function name to create a valid Graphviz identifier.
+    std::string safe_graph_name = func_name;
+    std::replace(safe_graph_name.begin(), safe_graph_name.end(), '.', '_');
+
+    // Use the sanitized name for the graph and its label.
+    dot_file << "digraph " << safe_graph_name << "_CFG {\n";
+    dot_file << "    labelloc=\"t\";\n";
+    dot_file << "    label=\"Control Flow Graph for " << func_name << "\";\n"; // Label can keep original name
+    // --- END OF FIX ---
+
+    dot_file << "    node [shape=box, fontname=\"Courier New\"];\n";
+
+    auto vertices = boost::vertices(cfg);
+    for (auto it = vertices.first; it != vertices.second; ++it) {
+        const auto& block = cfg[*it];
+        dot_file << "    Node" << block.id << " [label=\"";
+        dot_file << "Block " << block.id << " (starts at " << block.start_offset << ")\\l\\l";
+        for (const auto& instr : block.instructions) {
+            dot_file << std::to_string(instr.offset) << ": " << instr.opname;
+            if (instr.arg != -1) {
+                // Escape quotes in argval to prevent breaking the dot file
+                std::string safe_argval = instr.argval;
+                size_t pos = 0;
+                while ((pos = safe_argval.find('"', pos)) != std::string::npos) {
+                    safe_argval.replace(pos, 1, "\\\"");
+                    pos += 2;
+                }
+                dot_file << " " << safe_argval;
+            }
+            dot_file << "\\l";
+        }
+        dot_file << "\"];\n";
+    }
+
+    auto edges = boost::edges(cfg);
+    for (auto it = edges.first; it != edges.second; ++it) {
+        CFGVertex u = boost::source(*it, cfg);
+        CFGVertex v = boost::target(*it, cfg);
+        dot_file << "    Node" << cfg[u].id << " -> Node" << cfg[v].id;
+        dot_file << " [label=\"" << cfg[*it].label << "\"];\n";
+    }
+
+    dot_file << "}\n";
+    dot_file.close();
+}
+
+void generate_dependency_graph(
+    const std::string& initial_script_name,
+    const std::string& script_dir
+) {
+    DependencyGraph dep_graph;
+    std::map<std::string, DependencyVertex> known_nodes;
+    std::set<std::string> processed_files;
+    std::queue<std::string> files_to_process;
+
+    // 1. Start the queue with the initial script
+    files_to_process.push(initial_script_name);
+
+    // 2. Process files until the queue is empty
+    while (!files_to_process.empty()) {
+        std::string current_file_name = files_to_process.front();
+        files_to_process.pop();
+
+        if (processed_files.count(current_file_name)) {
+            continue; // Already processed, skip to avoid cycles
+        }
+        processed_files.insert(current_file_name);
+
+        // 3. Get or create the graph node for the current file
+        DependencyVertex current_vertex;
+        if (known_nodes.find(current_file_name) == known_nodes.end()) {
+            current_vertex = boost::add_vertex(dep_graph);
+            known_nodes[current_file_name] = current_vertex;
+        } else {
+            current_vertex = known_nodes[current_file_name];
+        }
+        dep_graph[current_vertex].name = current_file_name;
+        dep_graph[current_vertex].type = "File";
+        dep_graph[current_vertex].color = "skyblue";
+
+
+        // 4. Analyze the current file to find its dependencies
+        std::set<std::string> dependencies;
+        PyObject* pModule = load_python_module(current_file_name.c_str());
+        if (!pModule) {
+            std::cerr << "Warning: Could not load module " << current_file_name << " to scan for dependencies." << std::endl;
+            continue;
+        }
+
+        std::vector<std::string> functions, classes;
+        find_classes_and_functions(pModule, classes, functions); // Find all functions in this module
+        
+        for (const auto& func_name : functions) {
+            PyObject* pFunc = load_python_function(pModule, func_name.c_str());
+            if (pFunc) {
+                auto instructions = disassemble_function(pFunc);
+                for (const auto& inst : instructions) {
+                    if (inst.opname == "IMPORT_NAME") {
+                        dependencies.insert(inst.argval);
+                    }
+                }
+                Py_DECREF(pFunc);
+            }
+        }
+        Py_DECREF(pModule);
+
+
+        // 5. Process the found dependencies
+        for (const auto& dep_name : dependencies) {
+            DependencyVertex dep_vertex;
+            if (known_nodes.find(dep_name) == known_nodes.end()) {
+                dep_vertex = boost::add_vertex(dep_graph);
+                known_nodes[dep_name] = dep_vertex;
+            } else {
+                dep_vertex = known_nodes[dep_name];
+            }
+            dep_graph[dep_vertex].name = dep_name;
+
+            // Add an edge from the current file to its dependency
+            boost::add_edge(current_vertex, dep_vertex, dep_graph);
+
+            // 6. If the dependency is a local file, add it to the queue to be processed
+            if (std::filesystem::exists(script_dir + "/" + dep_name + ".py")) {
+                dep_graph[dep_vertex].type = "File";
+                dep_graph[dep_vertex].color = "skyblue";
+                files_to_process.push(dep_name); // This creates the multi-layer effect
+            } else {
+                dep_graph[dep_vertex].type = "Library";
+                dep_graph[dep_vertex].color = "palegreen";
+            }
+        }
+    }
+
+    // 7. Write the final, complete graph to a .dot file
+    std::ofstream dot_file("output/dependency_graph.dot");
+    boost::write_graphviz(dot_file, dep_graph,
+        [&](std::ostream& out, const DependencyVertex& v) {
+            out << "[label=\"" << dep_graph[v].name <<
+                // << "\", style=filled, fillcolor=" << dep_graph[v].color <<
+                 "\"]";
+        }
+    );
+    std::cout << "Multi-layer dependency graph written to output/dependency_graph.dot" << std::endl;
 }
 
 void write_instructions_to_file(
@@ -1186,6 +1483,31 @@ int main(int argc, char* argv[]) {
         } else {
             std::cout << "No data generated for master graph." << std::endl;
         }
+
+            std::cout << "\nGenerating Control Flow Graphs..." << std::endl;
+
+        std::filesystem::create_directories("output/cfgs");
+
+        for (const auto& entry : instruction_map_data) {
+            const std::string& func_name = entry.first;
+            const std::vector<Instruction>& instructions = entry.second;
+
+            if (instructions.empty()) {
+                std::cout << "Skipping CFG for " << func_name << " (no instructions)." << std::endl;
+                continue;
+            }
+
+            ControlFlowGraph cfg = generate_cfg_from_instructions(instructions);
+            
+            std::string safe_name = func_name;
+            std::replace(safe_name.begin(), safe_name.end(), '.', '_');
+            std::string cfg_filename = "output/cfgs/" + safe_name + "_cfg.dot";
+            
+            write_cfg_to_dot(cfg_filename, cfg, func_name);
+        }
+        std::cout << "Control Flow Graphs written to output/cfgs/" << std::endl;
+
+        generate_dependency_graph(script_name, script_dir_path);
 
         Py_DECREF(pFuncToAnalyze);
     } else {

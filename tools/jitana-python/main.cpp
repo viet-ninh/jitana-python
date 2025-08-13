@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <map>
 
 
 #include <boost/graph/adjacency_list.hpp>
@@ -50,6 +51,7 @@ struct DependencyNode {
 struct BasicBlock {
     int id = -1;
     int start_offset = -1;
+    std::string function_name;
     std::vector<Instruction> instructions;
 };
 
@@ -862,7 +864,10 @@ std::map<std::string, std::vector<Instruction>> disassemble_all_called_functions
 }
 
 // Main function to generate a CFG from a list of instructions
-ControlFlowGraph generate_cfg_from_instructions(const std::vector<Instruction>& instructions) {
+ControlFlowGraph generate_cfg_from_instructions(
+    const std::vector<Instruction>& instructions,
+    const std::string& func_name 
+) {
     ControlFlowGraph cfg;
     if (instructions.empty()) {
         return cfg;
@@ -910,6 +915,7 @@ ControlFlowGraph generate_cfg_from_instructions(const std::vector<Instruction>& 
         CFGVertex v = boost::add_vertex(cfg);
         cfg[v].id = block_id_counter++;
         cfg[v].start_offset = offset;
+        cfg[v].function_name = func_name;
         block_start_to_vertex[offset] = v;
     }
 
@@ -963,6 +969,150 @@ ControlFlowGraph generate_cfg_from_instructions(const std::vector<Instruction>& 
     }
 
     return cfg;
+}
+
+ControlFlowGraph generate_icfg(const std::map<std::string, std::vector<Instruction>>& all_instructions) {
+    ControlFlowGraph icfg; // The master graph
+    // This map will help us find master vertices later: func_name -> {block_start_offset -> master_vertex}
+    std::map<std::string, std::map<int, CFGVertex>> master_block_map;
+
+    // --- Part 1: Generate all individual CFGs and merge them into the ICFG ---
+    for (const auto& pair : all_instructions) {
+        const std::string& func_name = pair.first;
+        const std::vector<Instruction>& instructions = pair.second;
+        if (instructions.empty()) continue;
+
+        ControlFlowGraph local_cfg = generate_cfg_from_instructions(instructions, func_name);
+        
+        // Map vertices from the local graph to the master ICFG
+        std::map<CFGVertex, CFGVertex> local_to_master_map;
+
+        // Copy vertices
+        for (auto v_local : boost::make_iterator_range(boost::vertices(local_cfg))) {
+            CFGVertex v_master = boost::add_vertex(icfg);
+            icfg[v_master] = local_cfg[v_local]; // Copy all properties
+            local_to_master_map[v_local] = v_master;
+            master_block_map[func_name][icfg[v_master].start_offset] = v_master;
+        }
+
+        // Copy intra-procedural edges (jumps, sequential)
+        for (auto e_local : boost::make_iterator_range(boost::edges(local_cfg))) {
+            CFGVertex src_master = local_to_master_map[boost::source(e_local, local_cfg)];
+            CFGVertex tgt_master = local_to_master_map[boost::target(e_local, local_cfg)];
+            auto e_master = boost::add_edge(src_master, tgt_master, icfg).first;
+            icfg[e_master] = local_cfg[e_local]; // Copy edge properties
+        }
+    }
+
+    // --- Part 2: Add inter-procedural (call/return) edges ---
+    for (auto v_call_site : boost::make_iterator_range(boost::vertices(icfg))) {
+        auto& block = icfg[v_call_site];
+        for (size_t i = 0; i < block.instructions.size(); ++i) {
+            if (block.instructions[i].opname.find("CALL") != std::string::npos) {
+                // We found a call site!
+                std::string base_name, attr_name, called_func_name;
+                find_callable_info_stack_based(block.instructions, i, base_name, attr_name, called_func_name);
+
+                // Check if we have the bytecode for the function being called
+                if (!called_func_name.empty() && master_block_map.count(called_func_name)) {
+                    // Find the entry and exit points of the called function
+                    CFGVertex callee_entry = master_block_map[called_func_name][0]; // Entry is block at offset 0
+                    
+                    // Add a "call" edge
+                    auto e_call = boost::add_edge(v_call_site, callee_entry, icfg).first;
+                    icfg[e_call].label = "Call";
+
+                    // Find the return site (the block that follows the call site)
+                    for(auto e_out : boost::make_iterator_range(boost::out_edges(v_call_site, icfg))) {
+                        if (icfg[e_out].label.find("Sequential") != std::string::npos || 
+                            icfg[e_out].label.find("Fall-through") != std::string::npos) {
+                            CFGVertex v_return_site = boost::target(e_out, icfg);
+
+                            // Find all exit blocks of the callee and connect them back
+                            for (auto const& [offset, v_callee] : master_block_map[called_func_name]) {
+                                const Instruction& last_instr = icfg[v_callee].instructions.back();
+                                if (last_instr.opname.find("RETURN") != std::string::npos) {
+                                    auto e_return = boost::add_edge(v_callee, v_return_site, icfg).first;
+                                    icfg[e_return].label = "Return";
+                                }
+                            }
+                            break; // Assume one sequential successor
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return icfg;
+}
+
+void write_icfg_to_dot(const std::string& filename, const ControlFlowGraph& icfg) {
+    std::ofstream dot_file(filename);
+    if (!dot_file) {
+        std::cerr << "Error: Unable to open " << filename << " for writing.\n";
+        return;
+    }
+
+    dot_file << "digraph ICFG {\n";
+    dot_file << "    compound=true;\n";
+    dot_file << "    fontname=\"Courier New\";\n";
+    dot_file << "    node [shape=box];\n"; // Simplified node style
+
+    // Helper lambda to create sanitized node names consistently
+    auto make_node_name = [&](CFGVertex v) {
+        std::string safe_name = icfg[v].function_name;
+        std::replace(safe_name.begin(), safe_name.end(), '.', '_');
+        return "Node_" + safe_name + "_" + std::to_string(icfg[v].id);
+    };
+
+    // Group nodes by function name to create clusters
+    std::map<std::string, std::vector<CFGVertex>> function_clusters;
+    for (auto v : boost::make_iterator_range(boost::vertices(icfg))) {
+        function_clusters[icfg[v].function_name].push_back(v);
+    }
+
+    // Write out all the clusters (subgraphs)
+    for (const auto& cluster : function_clusters) {
+        std::string cluster_name = cluster.first;
+        std::replace(cluster_name.begin(), cluster_name.end(), '.', '_');
+        dot_file << "    subgraph cluster_" << cluster_name << " {\n";
+        dot_file << "        label = \"" << cluster.first << "\";\n";
+        dot_file << "        style = filled;\n";
+        dot_file << "        color = lightgrey;\n";
+        dot_file << "        node [style=filled, color=white];\n";
+
+        for (auto v : cluster.second) {
+            const auto& block = icfg[v];
+            dot_file << "        " << make_node_name(v) << " [label=\""; // Use helper
+            dot_file << "Block " << block.id << "\\l";
+            for (const auto& instr : block.instructions) {
+                // ... (rest of the label generation is fine)
+                dot_file << std::to_string(instr.offset) << ": " << instr.opname << " " << instr.argval << "\\l";
+            }
+            dot_file << "\"];\n";
+        }
+        dot_file << "    }\n";
+    }
+
+    // Write out all the edges
+    for (auto e : boost::make_iterator_range(boost::edges(icfg))) {
+        CFGVertex u = boost::source(e, icfg);
+        CFGVertex v = boost::target(e, icfg);
+        dot_file << "    " << make_node_name(u) << " -> " << make_node_name(v); // Use helper
+
+        dot_file << " [label=\"" << icfg[e].label << "\"";
+        if (icfg[e].label == "Call") {
+            std::string target_cluster_name = icfg[v].function_name;
+            std::replace(target_cluster_name.begin(), target_cluster_name.end(), '.', '_');
+            dot_file << ", color=blue, style=dashed, lhead=cluster_" << target_cluster_name << "";
+        } else if (icfg[e].label == "Return") {
+            dot_file << ", color=green, style=dashed";
+        }
+        dot_file << "];\n";
+    }
+
+    dot_file << "}\n";
+    dot_file.close();
 }
 
 // New function to write the generated CFG to a .dot file
@@ -1488,24 +1638,11 @@ int main(int argc, char* argv[]) {
 
         std::filesystem::create_directories("output/cfgs");
 
-        for (const auto& entry : instruction_map_data) {
-            const std::string& func_name = entry.first;
-            const std::vector<Instruction>& instructions = entry.second;
+        std::cout << "\nGenerating Interprocedural Control Flow Graph..." << std::endl;
+        ControlFlowGraph icfg = generate_icfg(instruction_map_data);
 
-            if (instructions.empty()) {
-                std::cout << "Skipping CFG for " << func_name << " (no instructions)." << std::endl;
-                continue;
-            }
-
-            ControlFlowGraph cfg = generate_cfg_from_instructions(instructions);
-            
-            std::string safe_name = func_name;
-            std::replace(safe_name.begin(), safe_name.end(), '.', '_');
-            std::string cfg_filename = "output/cfgs/" + safe_name + "_cfg.dot";
-            
-            write_cfg_to_dot(cfg_filename, cfg, func_name);
-        }
-        std::cout << "Control Flow Graphs written to output/cfgs/" << std::endl;
+        write_icfg_to_dot("output/icfg.dot", icfg);
+        std::cout << "Interprocedural CFG written to output/icfg.dot" << std::endl;
 
         generate_dependency_graph(script_name, script_dir_path);
 
